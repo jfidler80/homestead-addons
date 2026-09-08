@@ -1,0 +1,9 @@
+{
+  "name": "homestead-capture",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "puppeteer-core": "^22.15.0"
+  }
+}

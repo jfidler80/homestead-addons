@@ -1,0 +1,29 @@
+name: Homestead Capture
+version: "0.1.0"
+slug: homestead_capture
+description: Live JPEG frames from WebRTC-only Nest cameras (Google Device Access) via a headless browser. Powers the Homestead camera brain in Home Assistant.
+url: https://github.com/jfidler80/homestead
+arch:
+  - amd64
+  - aarch64
+startup: services
+boot: auto
+init: false
+ports:
+  8099/tcp: 8099
+ports_description:
+  8099/tcp: Capture API (POST /capture, GET /frame.jpg)
+map:
+  - media:rw
+options:
+  client_id: ""
+  client_secret: ""
+  refresh_token: ""
+  project_id: ""
+  secret: "hs_frame_local"
+schema:
+  client_id: str
+  client_secret: password
+  refresh_token: password
+  project_id: str
+  secret: str

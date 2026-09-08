@@ -1,0 +1,56 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>capture</title>
+<style>html,body{margin:0;background:#000} video{width:1280px;height:720px;display:block;background:#000}</style>
+</head>
+<body>
+<video id="v" autoplay muted playsinline width="1280" height="720"></video>
+<canvas id="c" width="1280" height="720" style="display:none"></canvas>
+<script>
+(function () {
+  const video = document.getElementById("v");
+  const canvas = document.getElementById("c");
+  const log = (m) => console.log("[capture] " + m);
+  const fail = (e) => { window.__error = String(e && e.message || e); log("ERROR " + window.__error); };
+  window.__frameReady = false; window.__error = null;
+
+  function drawFrame() { const ctx = canvas.getContext("2d", { willReadFrequently: true }); ctx.drawImage(video, 0, 0, canvas.width, canvas.height); return ctx; }
+  function frameHasContent(ctx) {
+    const w = canvas.width, h = canvas.height; let bright = 0;
+    for (let y = h * 0.1; y < h; y += h * 0.2) for (let x = w * 0.1; x < w; x += w * 0.2) {
+      const p = ctx.getImageData(x | 0, y | 0, 1, 1).data; if (p[0] + p[1] + p[2] > 30) bright++;
+    }
+    return bright >= 2;
+  }
+  window.__grabFrame = function () { drawFrame(); return canvas.toDataURL("image/jpeg", 0.85); };
+  function pollReady() {
+    if (window.__frameReady) return;
+    try { if (video.readyState >= 2 && video.videoWidth > 0 && frameHasContent(drawFrame())) { window.__frameReady = true; log("frame ready " + video.videoWidth + "x" + video.videoHeight); return; } } catch (e) { log("poll err " + e); }
+    setTimeout(pollReady, 150);
+  }
+  async function go() {
+    const deviceId = new URLSearchParams(location.search).get("device");
+    if (!deviceId) throw new Error("missing ?device=");
+    const pc = new RTCPeerConnection();
+    pc.addTransceiver("audio", { direction: "recvonly" });
+    pc.addTransceiver("video", { direction: "recvonly" });
+    pc.createDataChannel("dataChannel");
+    const stream = new MediaStream();
+    pc.ontrack = (e) => { stream.addTrack(e.track); video.srcObject = stream; video.play().catch((err) => log("play() " + err)); };
+    pc.onconnectionstatechange = () => { if (["failed", "closed"].includes(pc.connectionState) && !window.__frameReady) fail("peer connection " + pc.connectionState); };
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await new Promise((res) => { if (pc.iceGatheringState === "complete") return res(); const done = () => { if (pc.iceGatheringState === "complete") { pc.removeEventListener("icegatheringstatechange", done); res(); } }; pc.addEventListener("icegatheringstatechange", done); setTimeout(res, 2000); });
+    const r = await fetch("/offer", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ device_id: deviceId, offer_sdp: pc.localDescription.sdp }) });
+    const data = await r.json().catch(() => null);
+    if (!r.ok || !data || !data.answer_sdp) throw new Error("offer " + r.status + ": " + (data && data.error || ""));
+    await pc.setRemoteDescription({ type: "answer", sdp: data.answer_sdp });
+    pollReady();
+  }
+  go().catch(fail);
+})();
+</script>
+</body>
+</html>
