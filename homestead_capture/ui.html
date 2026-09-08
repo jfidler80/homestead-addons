@@ -1,0 +1,131 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Homestead</title>
+<style>
+  :root { --ink:#1c1c1a; --muted:#6b6b66; --line:#e3e1db; --bg:#f7f6f2; --card:#fff; --red:#e2442b; --ok:#3d8b40; }
+  html,body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.45 -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; }
+  header { display:flex; gap:18px; align-items:baseline; padding:18px 22px 8px; flex-wrap:wrap; }
+  h1 { margin:0; font-size:22px; letter-spacing:-.01em; }
+  nav a { margin-right:14px; color:var(--muted); text-decoration:none; font-weight:600; cursor:pointer; }
+  nav a.on { color:var(--ink); border-bottom:3px solid var(--red); }
+  main { padding:8px 22px 40px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px 16px; margin:12px 0; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); }
+  .mono { font-family:ui-monospace,Menlo,monospace; font-size:12px; color:var(--muted); }
+  .tag { display:inline-block; padding:2px 7px; border-radius:4px; font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; background:#eee; }
+  .tag.alert { background:#fde7e2; color:var(--red); } .tag.ok { background:#e6f3e6; color:var(--ok); } .tag.skip { background:#f1f1f1; color:var(--muted); }
+  img.thumb { width:120px; height:68px; object-fit:cover; border-radius:4px; background:#000; cursor:pointer; }
+  input,select,textarea { font:inherit; padding:5px 7px; border:1px solid var(--line); border-radius:5px; background:#fff; width:100%; box-sizing:border-box; }
+  textarea { min-height:70px; }
+  button { font:inherit; font-weight:600; padding:7px 12px; border-radius:6px; border:1px solid var(--ink); background:var(--ink); color:#fff; cursor:pointer; }
+  button.ghost { background:#fff; color:var(--ink); }
+  .row { display:grid; gap:10px; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); }
+  .grid2 { display:grid; gap:10px; grid-template-columns:1fr 2fr; }
+  .status { color:var(--muted); font-size:12px; margin-left:10px; }
+  .veh { border:1px solid var(--line); border-radius:6px; padding:10px; margin:8px 0; display:grid; gap:8px; }
+  .days label { margin-right:8px; }
+  .muted { color:var(--muted); }
+  .big { position:fixed; inset:0; background:rgba(0,0,0,.85); display:none; place-items:center; z-index:9; }
+  .big img { max-width:96vw; max-height:92vh; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Homestead</h1>
+  <nav><a id="t-log" class="on">Daily log</a><a id="t-vis">Visitors &amp; carpools</a><a id="t-cam">Cameras</a></nav>
+  <span class="status" id="status"></span>
+</header>
+<main>
+  <section id="log">
+    <div class="card" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+      <label>Day <input type="date" id="day" style="width:auto"></label>
+      <button class="ghost" id="reload">Refresh</button>
+      <span class="muted" id="logsum"></span>
+    </div>
+    <div class="card" style="overflow-x:auto">
+      <table><thead><tr><th>Seen</th><th>Camera</th><th>Received</th><th>Reviewed</th><th>Verdict</th><th>What Claude saw</th><th>Photo</th><th></th></tr></thead><tbody id="rows"></tbody></table>
+    </div>
+  </section>
+  <section id="vis" hidden>
+    <div class="card"><b>Groups</b> <span class="muted">— time windows shape how skeptical the review is; announcements say who is here, never the group.</span><div id="groups"></div><button class="ghost" id="addg">+ New group</button></div>
+    <div class="card"><b>Household vehicles</b><div id="hh"></div><button class="ghost" id="addh">+ Add household vehicle</button></div>
+    <div class="card"><b>Known visitor vehicles</b><div id="vv"></div><button class="ghost" id="addv">+ Add visitor vehicle</button></div>
+    <div class="card"><button id="savevis">Save visitors</button> <span class="muted">Claude uses the new list on the next event. Announcement audio (Dubón) is rendered on first use.</span></div>
+  </section>
+  <section id="cam" hidden>
+    <div class="card muted">Scene text tells Claude what it is looking at. Regions are fractions of the frame (x, y, w, h) and are zoomed 3× for review. "Use as empty reference" on a log row sets that camera's known-empty photo.</div>
+    <div id="cams"></div>
+    <div class="card"><button id="savecam">Save cameras</button></div>
+  </section>
+</main>
+<div class="big" id="big" onclick="this.style.display='none'"><img id="bigimg" alt="event photo"></div>
+<script>
+const $ = (s) => document.querySelector(s);
+const base = location.pathname.replace(/\/$/, "");
+const api = (p, opt) => fetch(base + p, opt).then((r) => r.json());
+const status = (m) => { $("#status").textContent = m; setTimeout(() => { if ($("#status").textContent === m) $("#status").textContent = ""; }, 4000); };
+const fmt = (iso) => new Date(iso).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", second: "2-digit" });
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+// ----- tabs -----
+for (const [t, s] of [["#t-log", "#log"], ["#t-vis", "#vis"], ["#t-cam", "#cam"]]) $(t).onclick = () => { document.querySelectorAll("nav a").forEach((a) => a.classList.remove("on")); $(t).classList.add("on"); for (const x of ["#log", "#vis", "#cam"]) $(x).hidden = x !== s; if (s === "#vis") loadVis(); if (s === "#cam") loadCams(); };
+
+// ----- log -----
+const today = new Date(); $("#day").value = new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York" }).format(today);
+async function loadLog() {
+  const evs = await api("/ui/events?day=" + $("#day").value);
+  $("#logsum").textContent = `${evs.length} events · ${evs.filter((e) => e.alert && !e.repeat_suppressed).length} alerts`;
+  $("#rows").innerHTML = evs.map((e) => {
+    const tag = e.status === "skipped" ? '<span class="tag skip">skipped</span>' : e.status === "error" ? '<span class="tag alert">error</span>' : e.alert ? `<span class="tag alert">${esc(e.category)}${e.repeat_suppressed ? " · muted" : ""}</span>` : `<span class="tag ok">${esc(e.category || "—")}</span>`;
+    const who = e.carrier ? `<div class="mono">${esc(e.carrier)}</div>` : "";
+    const what = e.status === "error" ? `<span class="muted">${esc(e.error)}</span>` : e.status === "skipped" ? `<span class="muted">${esc(e.reason)}</span>` : esc(e.description || "");
+    const ann = e.announcement ? `<div class="mono">🔊 ${esc(e.announcement)}</div>` : "";
+    const img = e.frame ? `<img class="thumb" src="${base}/ui/frame?f=${encodeURIComponent(e.frame)}" onclick="big(this.src)" alt="">` : "";
+    const btn = e.frame ? `<button class="ghost" onclick="setBaseline('${esc(e.camera)}','${esc(e.frame)}')">Use as empty reference</button>` : "";
+    return `<tr><td class="mono">${fmt(e.ts)}<br>${esc(e.kind)}${e.followup_of ? "<br>follow-up" : ""}</td><td>${esc(e.label)}</td><td class="mono">${e.received_ms != null ? "+" + (e.received_ms / 1000).toFixed(1) + "s" : "—"}</td><td class="mono">${e.reviewed_ms != null ? "+" + (e.reviewed_ms / 1000).toFixed(1) + "s" : "—"}</td><td>${tag}${who}</td><td>${what}${ann}</td><td>${img}</td><td>${btn}</td></tr>`;
+  }).join("") || '<tr><td colspan="8" class="muted">No events yet.</td></tr>';
+}
+window.big = (src) => { $("#bigimg").src = src; $("#big").style.display = "grid"; };
+window.setBaseline = async (camera, frame) => { const r = await api("/ui/baseline", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ camera, frame }) }); status(r.ok ? "Reference photo updated for " + camera : "Failed: " + r.error); };
+$("#reload").onclick = loadLog; $("#day").onchange = loadLog; loadLog(); setInterval(() => { if (!$("#log").hidden) loadLog(); }, 20000);
+
+// ----- visitors -----
+let V = { groups: [], vehicles: [] };
+const DAYS = [[1, "Mon"], [2, "Tue"], [3, "Wed"], [4, "Thu"], [5, "Fri"], [6, "Sat"], [7, "Sun"]];
+async function loadVis() { V = await api("/ui/visitors"); renderVis(); }
+function renderVis() {
+  $("#groups").innerHTML = V.groups.map((g, i) => `<div class="veh">
+    <div class="grid2"><label>Name<input value="${esc(g.name)}" oninput="V.groups[${i}].name=this.value"></label><label>Notes (shown to Claude)<input value="${esc(g.notes || "")}" oninput="V.groups[${i}].notes=this.value"></label></div>
+    <div class="days">Days: ${DAYS.map(([n, l]) => `<label><input type="checkbox" ${g.days?.includes(n) ? "checked" : ""} onchange="toggleDay(${i},${n},this.checked)">${l}</label>`).join("")}</div>
+    <div>Windows: ${(g.windows || []).map((w, j) => `<span style="display:inline-flex;gap:4px;align-items:center;margin:2px 8px 2px 0"><input style="width:90px" value="${esc(w.label)}" oninput="V.groups[${i}].windows[${j}].label=this.value"><input type="time" style="width:110px" value="${w.start}" oninput="V.groups[${i}].windows[${j}].start=this.value">–<input type="time" style="width:110px" value="${w.end}" oninput="V.groups[${i}].windows[${j}].end=this.value"><button class="ghost" onclick="V.groups[${i}].windows.splice(${j},1);renderVis()">×</button></span>`).join("")} <button class="ghost" onclick="V.groups[${i}].windows.push({label:'pickup',start:'07:30',end:'08:00'});renderVis()">+ window</button></div>
+    <div><label><input type="checkbox" ${g.enabled !== false ? "checked" : ""} onchange="V.groups[${i}].enabled=this.checked" style="width:auto"> Enabled</label> <button class="ghost" onclick="V.groups.splice(${i},1);renderVis()">Delete group</button></div></div>`).join("");
+  const veh = (x, i) => `<div class="veh">
+    <div class="grid2"><label>Owner / label<input value="${esc(x.name)}" oninput="V.vehicles[${i}].name=this.value"></label><label>What it looks like (color, make, model, body type)<input value="${esc(x.description)}" oninput="V.vehicles[${i}].description=this.value"></label></div>
+    ${x.role === "household" ? "" : `<div class="row"><label>Group<select onchange="V.vehicles[${i}].group_id=this.value?Number(this.value):null"><option value="">— none —</option>${V.groups.map((g) => `<option value="${g.id}" ${g.id === x.group_id ? "selected" : ""}>${esc(g.name)}</option>`).join("")}</select></label><label>Announcement<input value="${esc(x.message || "")}" placeholder="${esc(x.name.replace(/\\s*\\(.*$/, ""))} is here" oninput="V.vehicles[${i}].message=this.value"></label><label><input type="checkbox" style="width:auto" ${x.any_time ? "checked" : ""} onchange="V.vehicles[${i}].any_time=this.checked"> May arrive at any time (family)</label></div>`}
+    <div><label><input type="checkbox" style="width:auto" ${x.enabled !== false ? "checked" : ""} onchange="V.vehicles[${i}].enabled=this.checked"> Enabled</label> <button class="ghost" onclick="V.vehicles.splice(${i},1);renderVis()">Delete</button></div></div>`;
+  $("#hh").innerHTML = V.vehicles.map((x, i) => x.role === "household" ? veh(x, i) : "").join("");
+  $("#vv").innerHTML = V.vehicles.map((x, i) => x.role !== "household" ? veh(x, i) : "").join("");
+}
+window.toggleDay = (i, n, on) => { const d = new Set(V.groups[i].days || []); on ? d.add(n) : d.delete(n); V.groups[i].days = [...d].sort(); };
+$("#addg").onclick = () => { V.groups.push({ id: Math.max(0, ...V.groups.map((g) => g.id || 0)) + 1, name: "", days: [1, 2, 3, 4, 5], windows: [{ label: "pickup", start: "07:30", end: "08:00" }], enabled: true, notes: "" }); renderVis(); };
+$("#addh").onclick = () => { V.vehicles.push({ id: Math.max(0, ...V.vehicles.map((v) => v.id || 0)) + 1, name: "Household", description: "", role: "household", enabled: true }); renderVis(); };
+$("#addv").onclick = () => { V.vehicles.push({ id: Math.max(0, ...V.vehicles.map((v) => v.id || 0)) + 1, name: "", description: "", role: "visitor", group_id: null, any_time: false, message: "", enabled: true }); renderVis(); };
+$("#savevis").onclick = async () => { const r = await api("/ui/visitors", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(V) }); status(r.ok ? "Saved." : "Save failed"); };
+
+// ----- cameras -----
+let C = { cameras: [] };
+async function loadCams() { C = await api("/ui/cameras"); renderCams(); }
+function renderCams() {
+  $("#cams").innerHTML = C.cameras.map((c, i) => `<div class="card"><b>${esc(c.label)}</b> <span class="mono">${esc(c.key)} · reference: ${esc(c.baseline || "none")}</span>
+    <label>Scene<textarea oninput="C.cameras[${i}].scene=this.value">${esc(c.scene || "")}</textarea></label>
+    <div>Regions: ${(c.regions || []).map((r, j) => `<span style="display:inline-flex;gap:4px;margin:2px 8px 2px 0;align-items:center"><input style="width:110px" value="${esc(r.name)}" oninput="C.cameras[${i}].regions[${j}].name=this.value">${["x", "y", "w", "h"].map((k) => `<input type="number" step="0.01" min="0" max="1" style="width:64px" value="${r[k]}" oninput="C.cameras[${i}].regions[${j}].${k}=Number(this.value)">`).join("")}<button class="ghost" onclick="C.cameras[${i}].regions.splice(${j},1);renderCams()">×</button></span>`).join("")} <button class="ghost" onclick="(C.cameras[${i}].regions=C.cameras[${i}].regions||[]).push({name:'region',x:0,y:0,w:1,h:1});renderCams()">+ region</button></div></div>`).join("");
+}
+$("#savecam").onclick = async () => { const r = await api("/ui/cameras", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(C) }); status(r.ok ? "Saved." : "Save failed"); };
+</script>
+</body>
+</html>

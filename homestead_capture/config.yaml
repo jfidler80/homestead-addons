@@ -1,29 +1,47 @@
-name: Homestead Capture
-version: "0.1.0"
+name: Homestead
+version: "0.2.0"
 slug: homestead_capture
-description: Live JPEG frames from WebRTC-only Nest cameras (Google Device Access) via a headless browser. Powers the Homestead camera brain in Home Assistant.
-url: https://github.com/jfidler80/homestead
+description: The Homestead camera brain for Home Assistant — live frames from Nest cameras, Claude review via HA's AI task, visitor recognition, announcements, daily log.
+url: https://github.com/jfidler80/homestead-addons
 arch:
   - amd64
   - aarch64
 startup: services
 boot: auto
 init: false
+homeassistant_api: true
+ingress: true
+ingress_port: 8099
+panel_icon: mdi:cctv
+panel_title: Homestead
 ports:
   8099/tcp: 8099
 ports_description:
-  8099/tcp: Capture API (POST /capture, GET /frame.jpg)
+  8099/tcp: Homestead API (POST /event, /frame.jpg)
 map:
-  - media:rw
+  - type: media
+    read_only: false
+  - type: homeassistant_config
+    read_only: false
 options:
   client_id: ""
   client_secret: ""
   refresh_token: ""
   project_id: ""
   secret: "hs_frame_local"
+  ai_task_entity: "ai_task.claude_ai_task"
+  tts_entity: "tts.elevenlabs_text_to_speech"
+  tts_voice: "v6DEgBhz2pTxHfxaoCKu"
+  speakers: "media_player.home_assistant_voice_0a0948_media_player"
+  phone_notify: "mobile_app_josephs_iphone"
 schema:
   client_id: str
   client_secret: password
   refresh_token: password
   project_id: str
   secret: str
+  ai_task_entity: str
+  tts_entity: str
+  tts_voice: str?
+  speakers: str
+  phone_notify: str

@@ -6,6 +6,6 @@ ENV PUPPETEER_SKIP_DOWNLOAD=true \
 WORKDIR /app
 COPY package.json ./
 RUN npm install --omit=dev --no-audit --no-fund
-COPY server.js capture.html ./
+COPY server.js capture.html ui.html ./
 EXPOSE 8099
 CMD ["node", "server.js"]
