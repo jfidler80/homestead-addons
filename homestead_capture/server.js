@@ -232,7 +232,9 @@ async function analyze(cam, frames, when, eventId) {
       description: { selector: { text: {} }, description: "one sentence" },
     },
   });
-  const verdict = res?.service_response?.data ?? res?.data ?? {};
+  let verdict = res?.service_response?.data ?? res?.data ?? {};
+  if (typeof verdict === "string") { try { verdict = JSON.parse(verdict); } catch { verdict = { description: verdict }; } }
+  if (!verdict || typeof verdict !== "object" || !("category" in verdict)) { log("ai raw:", JSON.stringify(res).slice(0, 1500)); verdict = { ...(verdict || {}), raw_ai: JSON.stringify(res).slice(0, 800) }; }
   const household = (v.vehicles || []).filter((x) => x.role === "household" && x.enabled !== false).length || 2;
   const cnt = Number(verdict.vehicle_count);
   const explained = verdict.category === "known_visitor" || verdict.category === "delivery";
