@@ -199,7 +199,7 @@ function vehicleKey(desc) { const d = String(desc).toLowerCase(); const c = COLO
 
 // ---------- The pipeline ----------
 const inflight = new Map(); // camera -> ts of last review started
-async function analyze(cam, frames, when, eventId) {
+async function analyze(cam, frames, when, eventId, parent = null) {
   const workDir = path.join(MEDIA, "work", eventId); fs.mkdirSync(workDir, { recursive: true });
   const attachments = [];
   const add = (name, buf, label) => { const f = path.join(workDir, name); fs.writeFileSync(f, buf); attachments.push({ media_content_id: mediaId(f), media_content_type: "image/jpeg" }); return label; };
@@ -220,7 +220,8 @@ async function analyze(cam, frames, when, eventId) {
   }
   const v = cfg.visitors();
   const rules = cfg.rules().replace("{{VEHICLES}}", vehicleRules(v, when));
-  const instructions = `${parts.join("\n")}\n\n${rules}\n\nCAMERA SCENE (where things are in this camera's view): ${cam.scene || "not described"}\n\nContext: Camera "${cam.label}". Local time: ${when.toLocaleString("en-US", { timeZone: TZ })}.\n\nProcedure:\n1. Look at the zoomed crop(s) first. List EVERY vehicle, person, or notable object present in the region (color + type). Partially visible vehicles COUNT. If several frames are given they are a time sequence; judge by the LATEST frame.\n2. If a known-empty reference crop is given, state what is present now that is absent in the reference.\n3. Then apply the rules above. Keep region_contents to at most 4 short phrases.`;
+  const followup = parent ? `\n\nFOLLOW-UP LOOK: this is a second look ${Math.round(FOLLOWUP_MS / 1000)}s after an earlier frame from the same camera. Your earlier verdict was: category "${parent.category}", ${parent.vehicle_count ?? "?"} vehicle(s), "${parent.description ?? ""}". The ONLY purpose of this look is to catch a vehicle or person that has ARRIVED since then. Do not re-judge the vehicles you already accounted for; if the scene is the same, repeat the earlier verdict.` : "";
+  const instructions = `${parts.join("\n")}\n\n${rules}${followup}\n\nCAMERA SCENE (where things are in this camera's view): ${cam.scene || "not described"}\n\nContext: Camera "${cam.label}". Local time: ${when.toLocaleString("en-US", { timeZone: TZ })}.\n\nProcedure:\n1. Look at the zoomed crop(s) first. List EVERY vehicle, person, or notable object present in the region (color + type). Partially visible vehicles COUNT. If several frames are given they are a time sequence; judge by the LATEST frame.\n2. If a known-empty reference crop is given, state what is present now that is absent in the reference.\n3. Then apply the rules above. Keep region_contents to at most 4 short phrases.`;
   const res = await ha("POST", "/services/ai_task/generate_data?return_response", {
     task_name: `homestead-${cam.key}`, entity_id: AI_ENTITY, instructions, attachments,
     structure: {
@@ -274,12 +275,14 @@ async function runEvent({ camera, kind, source }, opts = {}) {
     ev.received_ms = Date.now() - now;
     const frameFile = path.join(MEDIA, "events", `${eventId}.jpg`); fs.writeFileSync(frameFile, frames[frames.length - 1]);
     ev.frame = path.relative("/media", frameFile);
-    const verdict = await analyze(cam, frames, new Date(now), eventId);
+    const parent = opts.followupOf ? recentEvents(1).find((e) => e.id === opts.followupOf) : null;
+    const verdict = await analyze(cam, frames, new Date(now), eventId, parent);
     Object.assign(ev, verdict, { status: "analyzed", reviewed_ms: Date.now() - now });
-    // follow-up: only keep if something changed
-    if (opts.followupOf) {
-      const parent = recentEvents(1).find((e) => e.id === opts.followupOf);
-      if (parent && parent.category === ev.category && String(parent.carrier ?? "") === String(ev.carrier ?? "") && Number(parent.vehicle_count ?? -1) === Number(ev.vehicle_count ?? -1)) { fs.rmSync(frameFile, { force: true }); return null; }
+    // follow-up: only keep if something NEW arrived (same verdict, or no extra vehicle, = nothing to add)
+    if (parent) {
+      const same = parent.category === ev.category && String(parent.carrier ?? "") === String(ev.carrier ?? "") && Number(parent.vehicle_count ?? -1) === Number(ev.vehicle_count ?? -1);
+      const noNewVehicle = !parent.alert && Number.isFinite(Number(ev.vehicle_count)) && Number(ev.vehicle_count) <= Number(parent.vehicle_count ?? Infinity);
+      if (same || noNewVehicle) { log(`follow-up ${eventId}: nothing new (${ev.category}, ${ev.vehicle_count})`); fs.rmSync(frameFile, { force: true }); return null; }
     }
     // repeat suppression for unknown vehicles
     if (ev.alert && ev.category === "unknown_vehicle") {
