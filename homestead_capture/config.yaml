@@ -1,5 +1,5 @@
 name: Homestead
-version: "0.2.1"
+version: "0.2.2"
 slug: homestead_capture
 description: The Homestead camera brain for Home Assistant — live frames from Nest cameras, Claude review via HA's AI task, visitor recognition, announcements, daily log.
 url: https://github.com/jfidler80/homestead-addons

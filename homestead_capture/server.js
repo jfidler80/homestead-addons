@@ -329,9 +329,10 @@ http.createServer(async (req, res) => {
       const args = req.method === "POST" ? body : { camera: url.searchParams.get("camera"), kind: url.searchParams.get("kind") || "vehicle", source: url.searchParams.get("source") || "test", wait: url.searchParams.get("wait") === "1" };
       const ev = runEvent(args); if (args.wait) return json(res, 200, await ev); ev.catch(() => {}); return json(res, 200, { ok: true });
     }
-    if (p === "/import" && req.method === "POST") { // {url, dest:"baselines/front_yard.jpg"} one-time migration helper
-      const r = await fetch(body.url); if (!r.ok) return json(res, 502, { error: "fetch " + r.status });
-      const dest = path.join(MEDIA, String(body.dest).replace(/\.\./g, "")); fs.mkdirSync(path.dirname(dest), { recursive: true }); fs.writeFileSync(dest, Buffer.from(await r.arrayBuffer())); return json(res, 200, { ok: true, dest });
+    if (p === "/import") { // {url, dest:"baselines/front_yard.jpg"} (POST JSON or GET query) — one-time migration helper
+      const src = body.url || url.searchParams.get("url"), destRel = body.dest || url.searchParams.get("dest");
+      const r = await fetch(src); if (!r.ok) return json(res, 502, { error: "fetch " + r.status });
+      const dest = path.join(MEDIA, String(destRel).replace(/\.\./g, "")); fs.mkdirSync(path.dirname(dest), { recursive: true }); fs.writeFileSync(dest, Buffer.from(await r.arrayBuffer())); return json(res, 200, { ok: true, dest, bytes: fs.statSync(dest).size });
     }
     if (p === "/frame.jpg" || (p === "/capture" && req.method === "POST")) {
       const deviceId = body.device_id || url.searchParams.get("device"); const name = body.name || url.searchParams.get("name");
