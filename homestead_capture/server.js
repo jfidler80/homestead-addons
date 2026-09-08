@@ -325,7 +325,10 @@ http.createServer(async (req, res) => {
     const body = req.method === "POST" ? JSON.parse(await readBody(req) || "{}") : {};
     const secret = body.secret || url.searchParams.get("secret");
     if (secret !== OPTIONS.secret) return json(res, 401, { error: "bad secret" });
-    if (p === "/event" && req.method === "POST") { const ev = runEvent(body); if (body.wait) return json(res, 200, await ev); ev.catch(() => {}); return json(res, 200, { ok: true }); }
+    if (p === "/event") { // POST JSON, or GET ?camera=&kind=&wait=1 for tests from HA's shell
+      const args = req.method === "POST" ? body : { camera: url.searchParams.get("camera"), kind: url.searchParams.get("kind") || "vehicle", source: url.searchParams.get("source") || "test", wait: url.searchParams.get("wait") === "1" };
+      const ev = runEvent(args); if (args.wait) return json(res, 200, await ev); ev.catch(() => {}); return json(res, 200, { ok: true });
+    }
     if (p === "/import" && req.method === "POST") { // {url, dest:"baselines/front_yard.jpg"} one-time migration helper
       const r = await fetch(body.url); if (!r.ok) return json(res, 502, { error: "fetch " + r.status });
       const dest = path.join(MEDIA, String(body.dest).replace(/\.\./g, "")); fs.mkdirSync(path.dirname(dest), { recursive: true }); fs.writeFileSync(dest, Buffer.from(await r.arrayBuffer())); return json(res, 200, { ok: true, dest });
