@@ -31,6 +31,9 @@ const READY_TIMEOUT_MS = 25_000;
 const COOLDOWN_S = 90;
 const FOLLOWUP_MS = 45_000;
 const REPEAT_HOURS = 3;
+const WATCH_MS = 180_000;        // keep looking this long after a motion event (cameras with watch: true)
+const WATCH_INTERVAL_MS = 8_000; // grab a frame this often while watching
+const WATCH_CHANGED = 0.05;      // fraction of region pixels that must change before Claude is asked again
 const AI_ENTITY = OPTIONS.ai_task_entity || "ai_task.claude_ai_task";
 const PAGE_HTML = fs.readFileSync(new URL("./capture.html", import.meta.url), "utf8");
 const UI_HTML = fs.readFileSync(new URL("./ui.html", import.meta.url), "utf8");
@@ -59,14 +62,23 @@ async function accessToken() {
   return token.value;
 }
 async function sdmOffer(deviceId, offerSdp) {
-  const at = await accessToken();
-  const r = await fetch(`${SDM}/enterprises/${OPTIONS.project_id}/devices/${deviceId}:executeCommand`, {
-    method: "POST", headers: { authorization: `Bearer ${at}`, "content-type": "application/json" },
-    body: JSON.stringify({ command: "sdm.devices.commands.CameraLiveStream.GenerateWebRtcStream", params: { offerSdp } }),
-  });
-  const j = await r.json();
-  if (!r.ok) throw new Error(`SDM ${r.status}: ${JSON.stringify(j).slice(0, 300)}`);
-  return { answer_sdp: j.results?.answerSdp, media_session_id: j.results?.mediaSessionId };
+  let lastErr;
+  for (let attempt = 1; attempt <= 3; attempt++) { // Google's WebRTC endpoint throws intermittent 500s; retry before giving up
+    try {
+      const at = await accessToken();
+      const r = await fetch(`${SDM}/enterprises/${OPTIONS.project_id}/devices/${deviceId}:executeCommand`, {
+        method: "POST", headers: { authorization: `Bearer ${at}`, "content-type": "application/json" },
+        body: JSON.stringify({ command: "sdm.devices.commands.CameraLiveStream.GenerateWebRtcStream", params: { offerSdp } }),
+      });
+      const j = await r.json();
+      if (!r.ok) { const e = new Error(`SDM ${r.status}: ${JSON.stringify(j).slice(0, 300)}`); e.retry = r.status >= 500 || r.status === 429; throw e; }
+      return { answer_sdp: j.results?.answerSdp, media_session_id: j.results?.mediaSessionId };
+    } catch (e) {
+      lastErr = e; if (e.retry === false) throw e;
+      log(`offer attempt ${attempt} failed: ${e.message}`); await new Promise((r) => setTimeout(r, 1500 * attempt));
+    }
+  }
+  throw lastErr;
 }
 
 // ---------- Headless browser: capture + crops ----------
@@ -84,7 +96,8 @@ function browser() {
 let chain = Promise.resolve();
 const serialize = (fn) => { const p = chain.then(fn, fn); chain = p.catch(() => {}); return p; };
 
-async function captureFrame(deviceId) {
+// Open a live WebRTC session to a camera; grab() returns the current frame as JPEG until close().
+async function openStream(deviceId) {
   const t0 = Date.now();
   const logs = [];
   const page = await (await browser()).newPage();
@@ -94,8 +107,33 @@ async function captureFrame(deviceId) {
     await page.waitForFunction(() => window.__frameReady === true || window.__error != null, { timeout: READY_TIMEOUT_MS, polling: 200 }).catch(() => {});
     const st = await page.evaluate(() => ({ ready: window.__frameReady === true, error: window.__error || null, vw: document.getElementById("v")?.videoWidth, vh: document.getElementById("v")?.videoHeight }));
     if (!st.ready) throw new Error((st.error || `no frame within ${READY_TIMEOUT_MS}ms`) + " | " + logs.slice(-3).join(" ; "));
-    const dataUrl = await page.evaluate(() => window.__grabFrame());
-    return { jpg: Buffer.from(String(dataUrl).replace(/^data:image\/jpeg;base64,/, ""), "base64"), width: st.vw, height: st.vh, ms: Date.now() - t0 };
+    const grab = async () => { const dataUrl = await page.evaluate(() => window.__grabFrame()); return Buffer.from(String(dataUrl).replace(/^data:image\/jpeg;base64,/, ""), "base64"); };
+    return { grab, width: st.vw, height: st.vh, ms: Date.now() - t0, close: () => page.close().catch(() => {}) };
+  } catch (e) { await page.close().catch(() => {}); throw e; }
+}
+async function captureFrame(deviceId) {
+  const s = await openStream(deviceId);
+  try { return { jpg: await s.grab(), width: s.width, height: s.height, ms: s.ms }; } finally { await s.close(); }
+}
+// Fraction of pixels (per region, at low resolution) that changed noticeably between two frames.
+async function regionChange(jpgA, jpgB, regions) {
+  if (!regions?.length) return {};
+  const page = await (await browser()).newPage();
+  try {
+    await page.setContent("<canvas id=a></canvas><canvas id=b></canvas><img id=ia><img id=ib>");
+    return await page.evaluate(async (a64, b64, regions) => {
+      const load = (id, src) => new Promise((r) => { const i = document.getElementById(id); i.onload = () => r(i); i.src = "data:image/jpeg;base64," + src; });
+      const [ia, ib] = await Promise.all([load("ia", a64), load("ib", b64)]);
+      const W = 96, H = 54, out = {};
+      const ca = document.getElementById("a"), cb = document.getElementById("b"); ca.width = cb.width = W; ca.height = cb.height = H;
+      for (const reg of regions) {
+        const draw = (c, img) => { const x = c.getContext("2d", { willReadFrequently: true }); x.drawImage(img, reg.x * img.naturalWidth, reg.y * img.naturalHeight, reg.w * img.naturalWidth, reg.h * img.naturalHeight, 0, 0, W, H); return x.getImageData(0, 0, W, H).data; };
+        const pa = draw(ca, ia), pb = draw(cb, ib); let changed = 0;
+        for (let i = 0; i < pa.length; i += 4) { const ga = (pa[i] + pa[i + 1] + pa[i + 2]) / 3, gb = (pb[i] + pb[i + 1] + pb[i + 2]) / 3; if (Math.abs(ga - gb) > 35) changed++; }
+        out[reg.name] = changed / (W * H);
+      }
+      return out;
+    }, jpgA.toString("base64"), jpgB.toString("base64"), regions);
   } finally { await page.close().catch(() => {}); }
 }
 // Crop regions (fractions of the frame) at 3× using a throwaway canvas page.
@@ -258,24 +296,58 @@ async function deliver(cam, ev, frameFile) {
   }
 }
 
+// Watch mode: after a motion event, keep one live stream open for WATCH_MS and grab a frame every
+// WATCH_INTERVAL_MS. Claude is only asked again when the watched region actually changed (a car pulling
+// up 30-90 s after Google's throttled motion event), each time with the previous verdict as context.
+const watches = new Map(); // camera -> { until, ref, last }
+function startWatch(cam, ev, refFrame) {
+  if (watches.has(cam.key)) { watches.get(cam.key).until = Date.now() + WATCH_MS; return; }
+  const w = { until: Date.now() + WATCH_MS, ref: refFrame, last: ev, n: 0, busy: false };
+  watches.set(cam.key, w);
+  (async () => {
+    let stream = null;
+    try {
+      stream = await serialize(() => openStream(cam.device_id));
+      log(`watch ${cam.key}: stream open in ${stream.ms}ms`);
+      while (Date.now() < w.until) {
+        await new Promise((r) => setTimeout(r, WATCH_INTERVAL_MS));
+        const jpg = await stream.grab();
+        if (!w.ref) { w.ref = jpg; // first look after a failed capture: review it outright
+          const child = await runEvent({ camera: cam.key, kind: "motion", source: "watch" }, { eventId: `${cam.key}-${Date.now()}-w${++w.n}`, followupOf: w.last?.id || "none", frames: [jpg] }).catch(() => null);
+          if (child && child.status === "analyzed") w.last = child; continue; }
+        const change = await regionChange(w.ref, jpg, cam.regions?.length ? cam.regions : [{ name: "frame", x: 0, y: 0, w: 1, h: 1 }]);
+        const max = Math.max(0, ...Object.values(change));
+        if (max < WATCH_CHANGED || w.busy) continue;
+        w.busy = true;
+        log(`watch ${cam.key}: region changed ${(max * 100).toFixed(0)}% → asking Claude`);
+        const child = await runEvent({ camera: cam.key, kind: "motion", source: "watch" }, { eventId: `${cam.key}-${Date.now()}-w${++w.n}`, followupOf: w.last?.id || "none", frames: [jpg] }).catch(() => null);
+        w.ref = jpg; if (child && child.status === "analyzed") w.last = child; w.busy = false;
+      }
+    } catch (e) { log(`watch ${cam.key} error:`, e.message); }
+    finally { if (stream) await stream.close(); watches.delete(cam.key); log(`watch ${cam.key}: done`); }
+  })();
+}
+
 async function runEvent({ camera, kind, source }, opts = {}) {
   const cams = cfg.cameras().cameras || [];
   const cam = cams.find((c) => c.key === camera || c.label?.toLowerCase() === String(camera).toLowerCase() || c.device_id === camera);
   if (!cam) throw new Error(`unknown camera "${camera}"`);
   const now = Date.now();
   const eventId = opts.eventId || `${cam.key}-${now}`;
-  const ev = { id: eventId, ts: new Date(now).toISOString(), camera: cam.key, label: cam.label, kind: kind || "motion", source: source || "ha", status: "received", followup_of: opts.followupOf || null };
+  const ev = { id: eventId, ts: new Date(now).toISOString(), camera: cam.key, label: cam.label, kind: kind || "motion", source: source || "ha", status: "received", followup_of: opts.followupOf && opts.followupOf !== "none" ? opts.followupOf : null };
   const last = inflight.get(cam.key) || 0;
   if (!opts.followupOf && now - last < COOLDOWN_S * 1000) { ev.status = "skipped"; ev.reason = `duplicate within ${COOLDOWN_S}s`; appendEvent(ev); return ev; }
+  const w = watches.get(cam.key);
+  if (!opts.followupOf && w) { w.until = Date.now() + WATCH_MS; ev.status = "skipped"; ev.reason = "already watching (extended)"; appendEvent(ev); return ev; }
   inflight.set(cam.key, now);
   try {
     const delays = kind === "vehicle" ? [0] : [0, 4000];
-    const frames = [];
-    for (const d of delays) { if (d) await new Promise((r) => setTimeout(r, d)); frames.push((await serialize(() => captureFrame(cam.device_id))).jpg); }
+    const frames = opts.frames ? [...opts.frames] : [];
+    if (!frames.length) for (const d of delays) { if (d) await new Promise((r) => setTimeout(r, d)); frames.push((await serialize(() => captureFrame(cam.device_id))).jpg); }
     ev.received_ms = Date.now() - now;
     const frameFile = path.join(MEDIA, "events", `${eventId}.jpg`); fs.writeFileSync(frameFile, frames[frames.length - 1]);
     ev.frame = path.relative("/media", frameFile);
-    const parent = opts.followupOf ? recentEvents(1).find((e) => e.id === opts.followupOf) : null;
+    const parent = opts.followupOf ? (recentEvents(1).find((e) => e.id === opts.followupOf) || null) : null;
     const verdict = await analyze(cam, frames, new Date(now), eventId, parent);
     Object.assign(ev, verdict, { status: "analyzed", reviewed_ms: Date.now() - now });
     // follow-up: only keep if something NEW arrived (same verdict, or no extra vehicle, = nothing to add)
@@ -292,11 +364,14 @@ async function runEvent({ camera, kind, source }, opts = {}) {
     appendEvent(ev);
     if (!ev.repeat_suppressed) await deliver(cam, ev, frameFile);
     fs.rmSync(path.join(MEDIA, "work", eventId), { recursive: true, force: true });
+    if (!opts.followupOf && cam.watch) startWatch(cam, ev, frames[frames.length - 1]);
     return ev;
   } catch (e) {
-    ev.status = "error"; ev.error = String(e.message || e).slice(0, 300); appendEvent(ev); log("event error:", ev.error); return ev;
+    ev.status = "error"; ev.error = String(e.message || e).slice(0, 300); appendEvent(ev); log("event error:", ev.error);
+    if (!opts.followupOf && cam.watch) startWatch(cam, null, null); // capture failed: keep trying for a while rather than giving up
+    return ev;
   } finally {
-    if (!opts.followupOf && kind === "vehicle") setTimeout(() => runEvent({ camera: cam.key, kind, source }, { eventId: `${eventId}-followup`, followupOf: eventId }).catch(() => {}), FOLLOWUP_MS);
+    if (!opts.followupOf && !cam.watch && kind === "vehicle") setTimeout(() => runEvent({ camera: cam.key, kind, source }, { eventId: `${eventId}-followup`, followupOf: eventId }).catch(() => {}), FOLLOWUP_MS);
   }
 }
 
@@ -310,7 +385,7 @@ http.createServer(async (req, res) => {
   const p = url.pathname.replace(/^\/api\/hassio_ingress\/[^/]+/, ""); // ingress prefix
   try {
     if (p === "/capture.html") { res.writeHead(200, { "content-type": "text/html" }); return res.end(PAGE_HTML); }
-    if (p === "/health") return json(res, 200, { ok: true, browser: !!browserP, cfg_dir: CFG_DIR, cameras: (cfg.cameras().cameras || []).map((c) => c.key) });
+    if (p === "/health") return json(res, 200, { ok: true, browser: !!browserP, cfg_dir: CFG_DIR, cameras: (cfg.cameras().cameras || []).map((c) => c.key), watching: [...watches.entries()].map(([k, w]) => ({ camera: k, seconds_left: Math.max(0, Math.round((w.until - Date.now()) / 1000)), looks: w.n })) });
     if (p === "/offer" && req.method === "POST") { const { device_id, offer_sdp } = JSON.parse(await readBody(req) || "{}"); return json(res, 200, await sdmOffer(device_id, offer_sdp)); }
     // ---- ingress UI + its JSON ----
     if (p === "/" || p === "") { res.writeHead(200, { "content-type": "text/html" }); return res.end(UI_HTML); }
