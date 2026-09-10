@@ -18,6 +18,7 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import puppeteer from "puppeteer-core";
+import WebSocket from "ws"; // ships with puppeteer-core
 
 const OPTIONS = JSON.parse(fs.readFileSync("/data/options.json", "utf8"));
 const PORT = 8099;
@@ -42,8 +43,10 @@ fs.mkdirSync(CFG_DIR, { recursive: true });
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 const readJson = (p, fallback) => { try { return JSON.parse(fs.readFileSync(p, "utf8")); } catch { return fallback; } };
+const DEFAULT_SCHEDULE = { days: [1, 2, 3, 4, 5, 6, 7], start: "06:30", end: "20:30" };
 const cfg = {
   cameras: () => readJson(path.join(CFG_DIR, "cameras.json"), { cameras: [] }),
+  schedule: () => ({ ...DEFAULT_SCHEDULE, ...(readJson(path.join(CFG_DIR, "cameras.json"), {}).schedule || {}) }),
   visitors: () => readJson(path.join(CFG_DIR, "visitors.json"), { groups: [], vehicles: [] }),
   rules: () => { try { return fs.readFileSync(path.join(CFG_DIR, "rules.md"), "utf8"); } catch { return "Describe what you see."; } },
 };
@@ -178,6 +181,13 @@ function localParts(d) {
 }
 const to12h = (hhmm) => { const [h, m] = hhmm.split(":").map(Number); return `${((h + 11) % 12) + 1}:${String(m).padStart(2, "0")} ${h >= 12 ? "PM" : "AM"}`; };
 const DAY = ["", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+// Review hours: outside these, camera events are counted but nothing is captured or sent to Claude.
+function withinSchedule(when = new Date()) {
+  const sc = cfg.schedule(); if (sc.enabled === false) return true;
+  const { isoDay, hhmm } = localParts(when);
+  return (sc.days || []).includes(isoDay) && sc.start <= hhmm && hhmm <= sc.end;
+}
+const ignored = {}; // dayKey -> { camera: count } of events outside review hours
 const daysLabel = (days) => { const s = [...days].sort().join(","); return s === "1,2,3,4,5" ? "Mon-Fri" : s === "1,2,3,4,5,6,7" ? "every day" : days.map((d) => DAY[d]).join("/"); };
 function activeWindow(g, when) { const { isoDay, hhmm } = localParts(when); if (!g.days?.includes(isoDay)) return null; return (g.windows || []).find((w) => w.start <= hhmm && hhmm <= w.end) ?? null; }
 function vehicleRules(v, when) {
@@ -225,6 +235,32 @@ async function audioFor(text) {
   } catch (e) { log("audio render failed:", e.message); return null; }
 }
 const mediaId = (file) => "media-source://media_source/local/" + path.relative("/media", file);
+
+// ---------- The Frame: art mode (Samsung "art-app" websocket channel, same protocol as samsungtvws) ----------
+// The Frame reports PowerState "on" while showing art, so HA's media_player.turn_on does nothing.
+// set_artmode_status off switches the panel to TV without the toggle risk of KEY_POWER.
+const FRAME_TOKEN_FILE = "/data/frame_token.json";
+async function frameArt(host, mode /* "on" | "off" | "status" */) {
+  const name = Buffer.from("Homestead").toString("base64");
+  let token = readJson(FRAME_TOKEN_FILE, {}).token || "";
+  return await new Promise((resolve, reject) => {
+    const ws = new WebSocket(`wss://${host}:8002/api/v2/channels/com.samsung.art-app?name=${name}${token ? `&token=${token}` : ""}`, { rejectUnauthorized: false, handshakeTimeout: 10_000 });
+    const timer = setTimeout(() => { ws.terminate(); reject(new Error("Frame: no answer in 35s (first use needs 'Allow' on the TV)")); }, 35_000);
+    const done = (v, e) => { clearTimeout(timer); try { ws.close(); } catch {} e ? reject(e) : resolve(v); };
+    const reqId = crypto.randomUUID();
+    ws.on("error", (e) => done(null, e));
+    ws.on("message", (raw) => {
+      let m; try { m = JSON.parse(String(raw)); } catch { return; }
+      if (m.event === "ms.channel.connect") {
+        if (m.data?.token && m.data.token !== token) { token = m.data.token; fs.writeFileSync(FRAME_TOKEN_FILE, JSON.stringify({ token })); }
+        const data = mode === "status" ? { request: "get_artmode_status", id: reqId } : { request: "set_artmode_status", value: mode, id: reqId };
+        ws.send(JSON.stringify({ method: "ms.channel.emit", params: { event: "art_app_request", to: "host", data: JSON.stringify(data) } }));
+        if (mode !== "status") setTimeout(() => done({ ok: true, mode }), 1500); // the TV rarely acks a set
+      } else if (m.event === "ms.channel.unauthorized") done(null, new Error("Frame: denied on the TV"));
+      else if (m.event === "d2d_service_message") { let d = {}; try { d = JSON.parse(m.data); } catch {} if (d.event === "artmode_status" || d.request === "get_artmode_status") done({ ok: true, artmode: d.value }); }
+    });
+  });
+}
 
 // ---------- Event log ----------
 const dayKey = (d = new Date()) => new Intl.DateTimeFormat("en-CA", { timeZone: TZ, year: "numeric", month: "2-digit", day: "2-digit" }).format(d);
@@ -309,7 +345,7 @@ function startWatch(cam, ev, refFrame) {
     try {
       stream = await serialize(() => openStream(cam.device_id));
       log(`watch ${cam.key}: stream open in ${stream.ms}ms`);
-      while (Date.now() < w.until) {
+      while (Date.now() < w.until && withinSchedule()) {
         await new Promise((r) => setTimeout(r, WATCH_INTERVAL_MS));
         const jpg = await stream.grab();
         if (!w.ref) { w.ref = jpg; // first look after a failed capture: review it outright
@@ -335,6 +371,7 @@ async function runEvent({ camera, kind, source }, opts = {}) {
   const now = Date.now();
   const eventId = opts.eventId || `${cam.key}-${now}`;
   const ev = { id: eventId, ts: new Date(now).toISOString(), camera: cam.key, label: cam.label, kind: kind || "motion", source: source || "ha", status: "received", followup_of: opts.followupOf && opts.followupOf !== "none" ? opts.followupOf : null };
+  if (source !== "test" && !withinSchedule(new Date(now))) { const d = (ignored[dayKey()] ||= {}); d[cam.key] = (d[cam.key] || 0) + 1; return { ...ev, status: "ignored", reason: "outside review hours" }; }
   const last = inflight.get(cam.key) || 0;
   if (!opts.followupOf && now - last < COOLDOWN_S * 1000) { ev.status = "skipped"; ev.reason = `duplicate within ${COOLDOWN_S}s`; appendEvent(ev); return ev; }
   const w = watches.get(cam.key);
@@ -392,7 +429,8 @@ http.createServer(async (req, res) => {
     if (p === "/ui/events") return json(res, 200, readEvents(url.searchParams.get("day") || dayKey()).reverse());
     if (p === "/ui/visitors" && req.method === "GET") return json(res, 200, cfg.visitors());
     if (p === "/ui/visitors" && req.method === "POST") { const body = JSON.parse(await readBody(req)); fs.writeFileSync(path.join(CFG_DIR, "visitors.json"), JSON.stringify(body, null, 2)); return json(res, 200, { ok: true }); }
-    if (p === "/ui/cameras" && req.method === "GET") return json(res, 200, cfg.cameras());
+    if (p === "/ui/cameras" && req.method === "GET") return json(res, 200, { ...cfg.cameras(), schedule: cfg.schedule() });
+    if (p === "/ui/ignored") return json(res, 200, ignored[url.searchParams.get("day") || dayKey()] || {});
     if (p === "/ui/cameras" && req.method === "POST") { const body = JSON.parse(await readBody(req)); fs.writeFileSync(path.join(CFG_DIR, "cameras.json"), JSON.stringify(body, null, 2)); return json(res, 200, { ok: true }); }
     if (p === "/ui/frame") { const rel = String(url.searchParams.get("f") || "").replace(/\.\./g, ""); const f = path.join("/media", rel); if (!fs.existsSync(f)) return json(res, 404, { error: "no frame" }); res.writeHead(200, { "content-type": "image/jpeg" }); return res.end(fs.readFileSync(f)); }
     if (p === "/ui/audio" && req.method === "POST") { const { text } = JSON.parse(await readBody(req) || "{}"); const f = await audioFor(text); return json(res, f ? 200 : 500, { file: f && path.relative("/media", f) }); }
@@ -405,6 +443,10 @@ http.createServer(async (req, res) => {
     const body = req.method === "POST" ? JSON.parse(await readBody(req) || "{}") : {};
     const secret = body.secret || url.searchParams.get("secret");
     if (secret !== OPTIONS.secret) return json(res, 401, { error: "bad secret" });
+    if (p === "/frame/art") { // ?mode=off|on|status&host=  — used by the "Watch the Braves" script
+      const host = url.searchParams.get("host") || OPTIONS.frame_host; if (!host) return json(res, 400, { error: "no frame_host configured" });
+      try { return json(res, 200, await frameArt(host, url.searchParams.get("mode") || "off")); } catch (e) { return json(res, 502, { error: e.message }); }
+    }
     if (p === "/event") { // POST JSON, or GET ?camera=&kind=&wait=1 for tests from HA's shell
       const args = req.method === "POST" ? body : { camera: url.searchParams.get("camera"), kind: url.searchParams.get("kind") || "vehicle", source: url.searchParams.get("source") || "test", wait: url.searchParams.get("wait") === "1" };
       const ev = runEvent(args); if (args.wait) return json(res, 200, await ev); ev.catch(() => {}); return json(res, 200, { ok: true });

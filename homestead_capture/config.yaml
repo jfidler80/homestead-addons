@@ -1,5 +1,5 @@
 name: Homestead
-version: "0.3.0"
+version: "0.4.0"
 slug: homestead_capture
 description: The Homestead camera brain for Home Assistant — live frames from Nest cameras, Claude review via HA's AI task, visitor recognition, announcements, daily log.
 url: https://github.com/jfidler80/homestead-addons
@@ -34,6 +34,7 @@ options:
   tts_voice: "v6DEgBhz2pTxHfxaoCKu"
   speakers: "media_player.home_assistant_voice_0a0948_media_player"
   phone_notify: "mobile_app_josephs_iphone"
+  frame_host: "192.168.4.109"
 schema:
   client_id: str
   client_secret: password
@@ -45,3 +46,4 @@ schema:
   tts_voice: str?
   speakers: str
   phone_notify: str
+  frame_host: str?

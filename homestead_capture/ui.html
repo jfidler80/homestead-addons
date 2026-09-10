@@ -59,8 +59,9 @@
   </section>
   <section id="cam" hidden>
     <div class="card muted">Scene text tells Claude what it is looking at. Regions are fractions of the frame (x, y, w, h) and are zoomed 3× for review. "Use as empty reference" on a log row sets that camera's known-empty photo.</div>
+    <div class="card" id="sched"></div>
     <div id="cams"></div>
-    <div class="card"><button id="savecam">Save cameras</button></div>
+    <div class="card"><button id="savecam">Save cameras &amp; review hours</button></div>
   </section>
 </main>
 <div class="big" id="big" onclick="this.style.display='none'"><img id="bigimg" alt="event photo"></div>
@@ -79,7 +80,9 @@ for (const [t, s] of [["#t-log", "#log"], ["#t-vis", "#vis"], ["#t-cam", "#cam"]
 const today = new Date(); $("#day").value = new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York" }).format(today);
 async function loadLog() {
   const evs = await api("/ui/events?day=" + $("#day").value);
-  $("#logsum").textContent = `${evs.length} events · ${evs.filter((e) => e.alert && !e.repeat_suppressed).length} alerts`;
+  const ign = await api("/ui/ignored?day=" + $("#day").value).catch(() => ({}));
+  const ignN = Object.values(ign).reduce((a, b) => a + b, 0);
+  $("#logsum").textContent = `${evs.length} events · ${evs.filter((e) => e.alert && !e.repeat_suppressed).length} alerts · ${evs.filter((e) => e.status === "analyzed").length} Claude reviews` + (ignN ? ` · ${ignN} ignored outside review hours` : "");
   $("#rows").innerHTML = evs.map((e) => {
     const tag = e.status === "skipped" ? '<span class="tag skip">skipped</span>' : e.status === "error" ? '<span class="tag alert">error</span>' : e.alert ? `<span class="tag alert">${esc(e.category)}${e.repeat_suppressed ? " · muted" : ""}</span>` : `<span class="tag ok">${esc(e.category || "—")}</span>`;
     const who = e.carrier ? `<div class="mono">${esc(e.carrier)}</div>` : "";
@@ -120,7 +123,15 @@ $("#savevis").onclick = async () => { const r = await api("/ui/visitors", { meth
 // ----- cameras -----
 let C = { cameras: [] };
 async function loadCams() { C = await api("/ui/cameras"); renderCams(); }
+function renderSched() {
+  const sc = C.schedule || (C.schedule = { days: [1, 2, 3, 4, 5, 6, 7], start: "06:30", end: "20:30" });
+  $("#sched").innerHTML = `<b>Review hours</b> <span class="muted">Camera events outside these days and times are ignored: no capture, no Claude review, no announcement.</span>
+    <div class="row" style="margin-top:8px">${DAYS.map(([n, l]) => `<label style="width:auto"><input type="checkbox" style="width:auto" ${sc.days.includes(n) ? "checked" : ""} onchange="const d=C.schedule.days; this.checked ? d.push(${n}) : d.splice(d.indexOf(${n}),1)"> ${l}</label>`).join("")}
+    <label style="width:auto">From <input type="time" style="width:auto" value="${sc.start}" onchange="C.schedule.start=this.value"></label>
+    <label style="width:auto">To <input type="time" style="width:auto" value="${sc.end}" onchange="C.schedule.end=this.value"></label></div>`;
+}
 function renderCams() {
+  renderSched();
   $("#cams").innerHTML = C.cameras.map((c, i) => `<div class="card"><b>${esc(c.label)}</b> <span class="mono">${esc(c.key)} · reference: ${esc(c.baseline || "none")}</span>
     <label>Scene<textarea oninput="C.cameras[${i}].scene=this.value">${esc(c.scene || "")}</textarea></label>
     <div>Regions: ${(c.regions || []).map((r, j) => `<span style="display:inline-flex;gap:4px;margin:2px 8px 2px 0;align-items:center"><input style="width:110px" value="${esc(r.name)}" oninput="C.cameras[${i}].regions[${j}].name=this.value">${["x", "y", "w", "h"].map((k) => `<input type="number" step="0.01" min="0" max="1" style="width:64px" value="${r[k]}" oninput="C.cameras[${i}].regions[${j}].${k}=Number(this.value)">`).join("")}<button class="ghost" onclick="C.cameras[${i}].regions.splice(${j},1);renderCams()">×</button></span>`).join("")} <button class="ghost" onclick="(C.cameras[${i}].regions=C.cameras[${i}].regions||[]).push({name:'region',x:0,y:0,w:1,h:1});renderCams()">+ region</button></div></div>`).join("");
