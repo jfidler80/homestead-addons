@@ -454,7 +454,8 @@ http.createServer(async (req, res) => {
     if (p === "/import") { // {url, dest:"baselines/front_yard.jpg"} (POST JSON or GET query) — one-time migration helper
       const src = body.url || url.searchParams.get("url"), destRel = body.dest || url.searchParams.get("dest");
       const r = await fetch(src); if (!r.ok) return json(res, 502, { error: "fetch " + r.status });
-      const dest = path.join(MEDIA, String(destRel).replace(/\.\./g, "")); fs.mkdirSync(path.dirname(dest), { recursive: true }); fs.writeFileSync(dest, Buffer.from(await r.arrayBuffer())); return json(res, 200, { ok: true, dest, bytes: fs.statSync(dest).size });
+      const root = (body.cfg || url.searchParams.get("cfg")) === "1" ? path.dirname(CFG_DIR) : MEDIA; // cfg=1 → HA config dir (e.g. esphome/models/…)
+      const dest = path.join(root, String(destRel).replace(/\.\./g, "")); fs.mkdirSync(path.dirname(dest), { recursive: true }); fs.writeFileSync(dest, Buffer.from(await r.arrayBuffer())); return json(res, 200, { ok: true, dest, bytes: fs.statSync(dest).size });
     }
     if (p === "/frame.jpg" || (p === "/capture" && req.method === "POST")) {
       const deviceId = body.device_id || url.searchParams.get("device"); const name = body.name || url.searchParams.get("name");
